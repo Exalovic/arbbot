@@ -20,19 +20,19 @@ class Poloniex extends Exchange {
 
   }
 
-  public function addFeeToPrice( $price ) {
+  public function addFeeToPrice( $price, $tradeable, $currency ) {
 
     return $price * (1 + $this->tradeFee);
 
   }
 
-  public function deductFeeFromAmountBuy( $amount ) {
+  public function deductFeeFromAmountBuy( $amount, $tradeable, $currency ) {
 
     return $amount * (1 - $this->tradeFee);
 
   }
 
-  public function deductFeeFromAmountSell( $amount ) {
+  public function deductFeeFromAmountSell( $amount, $tradeable, $currency ) {
 
     return $amount * (1 - $this->tradeFee);
 
@@ -58,7 +58,7 @@ class Poloniex extends Exchange {
 
   }
 
-  public function withdraw( $coin, $amount, $address ) {
+  public function withdraw( $coin, $amount, $address, $tag = null ) {
 
     try {
       $this->queryWithdraw( $coin, $amount, $address );
@@ -274,49 +274,6 @@ class Poloniex extends Exchange {
 
   }
 
-  private function queryRecentTransfers( $type, $currency ) {
-
-    $now = time();
-    $history = $this->queryAPI( 'returnDepositsWithdrawals', array(
-      'start' => $now - 30 * 60,
-      'end' => $now,
-    ) );
-
-    $result = array();
-    foreach ( $history[ "${type}s" ] as $row ) {
-      if ( !is_null( $currency ) && $currency != $row[ 'currency' ] ) {
-        continue;
-      }
-
-      $result[] = array(
-        'currency' => $row[ 'currency' ],
-        'amount' => $row[ 'amount' ],
-        // deposits have txid, withdrawals have withdrawalNumber
-        'txid' => isset( $row[ 'txid' ] ) ? $row[ 'txid' ] : $row[ 'withdrawalNumber' ],
-        'address' => $row[ 'address' ],
-        'time' => $row[ 'timestamp' ],
-        'pending' => strpos( $row[ 'status' ], 'COMPLETE' ) !== false,
-      );
-    }
-
-    usort( $result, 'compareByTime' );
-
-    return $result;
-
-  }
-
-  public function queryRecentDeposits( $currency = null ) {
-
-    return $this->queryRecentTransfers( 'deposit', $currency );
-
-  }
-
-  public function queryRecentWithdrawals( $currency = null ) {
-
-    return $this->queryRecentTransfers( 'withdrawal', $currency );
-
-  }
-
   protected function fetchOrderbook( $tradeable, $currency ) {
 
     $orderbook = $this->queryOrderbook( $tradeable, $currency );
@@ -436,11 +393,34 @@ class Poloniex extends Exchange {
     $this->tradeFee = floatval( $feeInfo[ 'takerFee' ] );
 
     $this->pairs = $pairs;
-    $this->transferFees = $fees;
+    $this->withdrawFees = $fees;
     $this->confirmationTimes = $conf;
     $this->depositAddresses = $depositAddresses;
 
     $this->calculateTradeablePairs();
+
+  }
+
+  public function getPrecision( $tradeable, $currency ) {
+
+    // Hardcode the precision
+    return array( 'amount' => 8, 'price' => 8 );
+
+  }
+
+  public function getLimits( $tradeable, $currency ) {
+
+    // Hardcode the limits
+    return array(
+      'amount' => array (
+          'min' => 0.00000001,
+          'max' => 1000000000,
+      ),
+      'price' => array (
+          'min' => 0.00000001,
+          'max' => 1000000000,
+      )
+    );
 
   }
 
@@ -458,7 +438,7 @@ class Poloniex extends Exchange {
         $status = strtoupper( $entry[ 'status' ] );
 
         if ( $timestamp < time() - 12 * 3600 && (substr( $status, 0, 8 ) != 'COMPLETE' || strpos( $status, 'ERROR' ) !== false) ) {
-          alert( 'stuck-transfer', $this->prefix() . "Stuck $key! Please investigate and open support ticket if neccessary!\n\n" . print_r( $entry, true ), true );
+          alert( 'stuck-transfer', $this->prefix() . "Stuck $key! Please investigate and open support ticket at Poloniex if neccessary!\n\n" . print_r( $entry, true ), true );
           $this->lastStuckReportTime[ $key ] = $timestamp;
         }
       }
@@ -466,28 +446,45 @@ class Poloniex extends Exchange {
 
   }
 
-  public function getWalletsConsideringPendingDeposits() {
+  private $lastDuplicateWithdrawalTime = 0;
 
-    $result = [ ];
-    foreach ( $this->wallets as $coin => $balance ) {
-      $result[ $coin ] = $balance;
-    }
+  public function detectDuplicateWithdrawals() {
+
     $history = $this->queryDepositsAndWithdrawals();
-
-    foreach ( $history[ 'deposits' ] as $entry ) {
-
+    $block = $history[ 'withdrawals' ];
+    usort( $block, 'compareByTimeStamp' );
+    $prevTimestamp = 0;
+    $prevTxId = '';
+    $prevAmount = '';
+    $prevAddress = '';
+    foreach ( $block as $entry ) {
       $status = strtoupper( $entry[ 'status' ] );
-      if ($status != 'PENDING') {
+      $timestamp = $entry[ 'timestamp' ];
+      if ( $timestamp < $this->lastDuplicateWithdrawalTime ||
+           substr( $status, 0, 10 ) != 'COMPLETE: ' ) {
         continue;
       }
-
-      $coin = strtoupper( $entry[ 'currency' ] );
+      // status is in the following format: "COMPLETE: txid"
+      $txid = substr( $status, 10 );
       $amount = $entry[ 'amount' ];
-      $result[ $coin ] += $amount;
+      $address = $entry[ 'address' ];
+      $matched = false;
+      if ( $timestamp == $prevTimestamp &&
+           $txid == $prevTxId &&
+           $amount == $prevAmount &&
+           $address == $prevAddress ) {
+        $matched = true;
+      }
+      $prevTimestamp = $timestamp;
+      $prevTxId = $txid;
+      $prevAmount = $amount;
+      $prevAddress = $address;
 
+      if ( $timestamp < time() - 24 * 3600 && $matched ) {
+        alert( 'duplicate-withdrawal', $this->prefix() . "Duplicate withdrawal! Please investigate and open support ticket at Poloniex if necessary!\r\r" . print_r( $entry, true ), true );
+        $this->lastDuplicateWithdrawalTime = $timestamp;
+      }
     }
-
-    return $result;
 
   }
 
@@ -497,7 +494,9 @@ class Poloniex extends Exchange {
 
   }
 
-  public function refreshWallets() {
+  public function refreshWallets( $tradesMade = array() ) {
+
+    $this->preRefreshWallets();
 
     $wallets = [ ];
 
@@ -507,6 +506,8 @@ class Poloniex extends Exchange {
 
     $this->wallets = $wallets;
 
+    $this->postRefreshWallets( $tradesMade );
+
   }
 
   public function testAccess() {
@@ -515,7 +516,7 @@ class Poloniex extends Exchange {
 
   }
 
-  public function getSmallestOrderSize() {
+  public function getSmallestOrderSize( $tradeable, $currency, $type ) {
 
     return '0.00010000';
 

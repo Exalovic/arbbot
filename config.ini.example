@@ -50,6 +50,9 @@ name = arbitrage
 ; The coin autobuy module will automatically buy the most profitable altcoins, if you assign it 'autobuy_funds' in the database
 coin-autobuy = true
 
+; The autobalance module will automatically balance the wallets across exchanges depending on the current needs and pending deposits.
+auto-balance = true
+
 ; The coin liquidation module will automatically sell coins that aren't profitable any more
 coin-liquidation = false
 
@@ -58,6 +61,12 @@ take-profit = false
 
 ; The trade module will do the arbitrage-trading stuff. Just in case you want to disable it for some reason...
 trade = true
+
+; Alert about stuck transfers between exchanges that haven't finished in the last 24 hours.
+stuck-detection = true
+
+; Alert about duplicate withdrawals detected on an exchange in the last 24 hours.
+duplicate-detection = true
 
 ; Detect coins that have balances at the exchange but the bot won't automatically liquidate
 unused-coins-detection = true
@@ -145,6 +154,16 @@ key =
 ; API secret for Bittrex
 secret =
 
+[bleutrade]
+
+; Bleutrade API keys can be generated on https://bleutrade.com/member/api_keys.
+
+; API key for Bleutrade
+key =
+
+; API secret for Bleutrade
+secret =
+
 [poloniex]
 
 ; Remember to enable withdrawals for POLONIEX!
@@ -153,6 +172,16 @@ secret =
 key =
 
 ; API secret for Poloniex
+secret =
+
+[binance]
+
+; Remember to enable withdrawals for BINANCE (it requires enabling IP whitelist on the API key)!
+
+; API key for Binance
+key =
+
+; API secret for Binance
 secret =
 
 ; PLEASE CHANGE THESE ONLY IF YOU ARE SURE WHAT YOU ARE DOING :)
@@ -199,6 +228,7 @@ rate-ema-period = 5
 interval-management = 1
 interval-take-profit = 12
 interval-stuck-detection = 12
+interval-duplicate-detection = 12
 interval-unused-coin-detection = 4
 interval-db-cleanup = 24
 

@@ -5,7 +5,6 @@ require_once __DIR__ . '/CoinManager.php';
 class Arbitrator {
 
   private $eventLoop;
-  private $errorCounter;
   private $exchanges;
   private $exchangePairs = [ ];
   private $profitablePairsOfTheDay = [ ];
@@ -19,7 +18,7 @@ class Arbitrator {
   function __construct( $loop, $exchanges, &$tradeMatcher ) {
     $this->eventLoop = $loop;
     $self = $this;
-    $this->eventLoop->addTimer( 1, function() use($self) {
+    $this->eventLoop->addPeriodicTimer( 1, function() use($self) {
       $self->innerRun();
     } );
 
@@ -54,13 +53,11 @@ class Arbitrator {
 
     $this->refreshWallets();
 
-    if ( $this->coinManager->doManage( $this ) ) {
-      return;
+    if ( !$this->coinManager->doManage( $this ) ) {
+      $this->cancelStrayOrders();
+
+      $this->checkOpportunities();
     }
-
-    $this->cancelStrayOrders();
-
-    $this->checkOpportunities();
 
     $this->updateRunTimestamp();
 
@@ -91,7 +88,8 @@ class Arbitrator {
 
     foreach ( $this->exchangePairs as $exchangePair ) {
 
-      if ( $this->checkOpportunitiesAt( $exchangePair[ 0 ], $exchangePair[ 1 ] ) ) {
+      if ( $this->checkOpportunitiesAt( $exchangePair[ 0 ], $exchangePair[ 1 ] ) ||
+           $this->checkOpportunitiesAt( $exchangePair[ 1 ], $exchangePair[ 0 ] ) ) {
         // Trade happened, restart...
         $this->tradeHappened = true;
         return;
@@ -102,7 +100,7 @@ class Arbitrator {
 
   private function checkOpportunitiesAt( $x1, $x2 ) {
 
-    $pairs = array_intersect( $x1->getTradeablePairs(), $x2->getTradeablePairs() );
+    $pairs = array_intersect( $x1->getWithdrawablePairs(), $x2->getDepositablePairs() );
     logg( "Checking " . $x1->getName() . " vs " . $x2->getName() . " (" . count( $pairs ) . " common pairs)" );
 
     // Create even more randomness
@@ -174,7 +172,7 @@ class Arbitrator {
       return;
     }
 
-    logg( "Checking $pair..." );
+    logg( "Checking $pair at " . $x1->getName() . " -> " . $x2->getName() . "..." );
 
     // Measure time for orderbook checks. Sometimes it takes 20+ seconds and could result in a failed trade
     $timeout = time() + 10;
@@ -192,16 +190,38 @@ class Arbitrator {
   }
 
   private function testOrderbooks( $o1, $o2 ) {
-    if ( is_null( $o1 ) || is_null( $o2 ) ) {
-      logg( "Received invalid orderbook. Skipping..." );
+    if ( is_null( $o1 ) ) {
+      logg( "Received invalid orderbook from source exchange. Skipping..." );
+      return false;
+    }
+    if ( is_null( $o2 ) ) {
+      logg( "Received invalid orderbook from target exchange. Skipping..." );
       return false;
     }
 
-    return ( $this->checkAndTrade( $o1, $o2 ) ) || $this->checkAndTrade( $o2, $o1 );
+    return $this->checkAndTrade( $o1, $o2 );
 
   }
 
   private function checkAndTrade( $sourceOrderbook, $targetOrderbook ) {
+
+    $currency = $sourceOrderbook->getCurrency();
+    $tradeable = $sourceOrderbook->getTradeable();
+    if ( ! in_array( $tradeable,
+                     array_map( 'getCurrency',
+                                $targetOrderbook->getSource()->getTradeables()
+                              ) ) ) {
+      return false;
+    }
+
+    $depositAddress = $targetOrderbook->getSource()->getDepositAddress( $tradeable );
+    if ( is_array( $depositAddress ) &&
+         !$sourceOrderbook->getSource()->withdrawSupportsTag() ) {
+      // If our deposit address includes a tag but our source exchange doesn't supports
+      // withdrawing with a tag, don't attempt to trade since we won't be able to perform
+      // a successful withdrawal.
+      return false;
+    }
 
     $sourceAsk = $sourceOrderbook->getBestAsk();
     $targetBid = $targetOrderbook->getBestBid();
@@ -209,9 +229,6 @@ class Arbitrator {
     if ( $targetBid->getPrice() <= $sourceAsk->getPrice() ) {
       return false;
     }
-
-    $currency = $sourceOrderbook->getCurrency();
-    $tradeable = $sourceOrderbook->getTradeable();
 
     /*
       Check for arbitrage opportunities. If the bid is higher than the ask
@@ -223,7 +240,7 @@ class Arbitrator {
 
 
     $amount = formatBTC( min( $sourceAsk->getAmount(), $targetBid->getAmount() ) );
-    $profit = $this->simulateTrade( $sourceOrderbook, $targetOrderbook, $amount );
+    $profit = $this->simulateTrade( $sourceOrderbook, $targetOrderbook, $amount, $currency );
     logg( "SPREAD : " . formatBTC( $targetBid->getPrice() - $sourceAsk->getPrice() ) . " $currency = " . formatBTC( max( 0, $profit ) ) . " $currency PROFIT" );
 
     if ( $profit < Config::get( Config::MIN_PROFIT, Config::DEFAULT_MIN_PROFIT ) ) {
@@ -249,6 +266,12 @@ class Arbitrator {
     $source = $sourceOrderbook->getSource();
     $target = $targetOrderbook->getSource();
 
+    $sourceLimits = $source->getLimits( $tradeable, $currency );
+    $targetLimits = $target->getLimits( $tradeable, $currency );
+
+    $sourcePrecision = $source->getPrecision( $tradeable, $currency );
+    $targetPrecision = $target->getPrecision( $tradeable, $currency );
+
     $sourceTradeableBefore = $source->getWallets()[ $tradeable ];
     $targetTradeableBefore = $target->getWallets()[ $tradeable ];
 
@@ -263,17 +286,18 @@ class Arbitrator {
     $bestSellRate = $targetOrderbook->getBestBid()->getPrice();
     $bestSellAmount = $targetOrderbook->getBestBid()->getAmount();
 
-    $maxSourceAmount = min( $sourceTradeableBefore,
-                            min( min( $maxTradeSize, $sourceCurrencyBefore ) / $bestBuyRate, $bestBuyAmount ) );
+    $maxSourceAmount = min( min( $maxTradeSize, $sourceCurrencyBefore ) / $bestBuyRate, $bestBuyAmount );
     $maxTargetAmount = min( $targetTradeableBefore, $bestSellAmount );
-    $tradeAmount = formatBTC( min( $maxSourceAmount, $maxTargetAmount ) );
+    $tradeAmount = $this->roundAmountToPrecision( min( $maxSourceAmount, $maxTargetAmount ), $sourcePrecision );
 
-    $buyPrice = $source->addFeeToPrice( $tradeAmount * $bestBuyRate );
-    $boughtAmount = $source->deductFeeFromAmountBuy( $tradeAmount );
+    $buyPrice = $source->addFeeToPrice( $tradeAmount * $bestBuyRate, $tradeable, $currency );
+    $boughtAmount = $source->deductFeeFromAmountBuy( $tradeAmount, $tradeable, $currency );
 
-    $txFee = $this->coinManager->getSafeTxFee( $source, $tradeable, $boughtAmount );
-    $sellAmount = formatBTC( $boughtAmount - $txFee );
-    $sellPrice = $target->deductFeeFromAmountSell( $sellAmount * $bestSellRate );
+    $withdrawFee = $this->coinManager->getSafeWithdrawFee( $source, $tradeable, $boughtAmount );
+    $depositFee = $this->coinManager->getSafeDepositFee( $target, $tradeable, $boughtAmount );
+    $txFee = $depositFee + $withdrawFee;
+    $sellAmount = $this->roundAmountToPrecision( $boughtAmount - $txFee, $targetPrecision );
+    $sellPrice = $target->deductFeeFromAmountSell( $sellAmount * $bestSellRate, $tradeable, $currency );
     $profit = $sellPrice - $buyPrice;
 
     $orderInfo = "TRADING $tradeable-$currency FROM " . $source->getName() . " TO " . $target->getName() . "\n";
@@ -307,63 +331,143 @@ class Arbitrator {
       return false;
     }
 
-    if ( $buyPrice < $source->getSmallestOrderSize() ) {
-      logg( $orderInfo . "NOT ENTERING TRADE: BUY PRICE IS BELOW ACCEPTABLE THRESHOLD\n" );
-      return false;
-    }
-    if ( $sellPrice < $target->getSmallestOrderSize() ) {
-      logg( $orderInfo . "NOT ENTERING TRADE: SELL PRICE IS BELOW ACCEPTABLE THRESHOLD\n" );
+    if ( !$this->checkTradeAmount( $tradeAmount, $sourceLimits, $orderInfo ) ) {
       return false;
     }
 
-    $increasedBuyRate = formatBTC( $bestBuyRate * Config::get( Config::BUY_RATE_FACTOR, Config::DEFAULT_BUY_RATE_FACTOR ) );
-    $reducedSellRate = formatBTC( $bestSellRate * Config::get( Config::SELL_RATE_FACTOR, Config::DEFAULT_SELL_RATE_FACTOR ) );
-
-    if ( $reducedSellRate * $sellAmount < $target->getSmallestOrderSize() ) {
-      $reducedSellRate = formatBTC( $target->getSmallestOrderSize() / $sellAmount + 0.00000001 );
+    if ( !is_null( $targetLimits[ 'amount' ][ 'min' ] ) &&
+         floatval( $targetLimits[ 'amount' ][ 'min' ] ) > $sellAmount ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: SELL AMOUNT IS BELOW EXCHANGE MINIMUM THRESHOLD\n" );
+      return false;
     }
 
-    if ( $reducedSellRate <= $increasedBuyRate ) {
-      logg( $orderInfo . sprintf( "NOT ENTERING TRADE: REDUCED SELL RATE %s IS BELOW INCREASED BUY RATE %s",
-                                  formatBTC( $reducedSellRate ), formatBTC( $increasedBuyRate ) ) );
+    if ( !is_null( $targetLimits[ 'amount' ][ 'max' ] ) &&
+         floatval( $targetLimits[ 'amount' ][ 'max' ] ) < $sellAmount ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: SELL AMOUNT IS ABOVE EXCHANGE MAXIMUM THRESHOLD\n" );
+      return false;
+    }
+
+    if ( $buyPrice < $source->getSmallestOrderSize( $tradeable, $currency, 'buy' ) ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: BUY COST IS BELOW ACCEPTABLE THRESHOLD\n" );
+      return false;
+    }
+    if ( $sellPrice < $target->getSmallestOrderSize( $tradeable, $currency, 'sell' ) ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: SELL COST IS BELOW ACCEPTABLE THRESHOLD\n" );
+      return false;
+    }
+
+    $increasedBuyRate = $this->roundPriceToPrecision( $bestBuyRate * Config::get( Config::BUY_RATE_FACTOR, Config::DEFAULT_BUY_RATE_FACTOR ),
+                                                      $sourcePrecision );
+    $reducedSellRate = $this->roundPriceToPrecision( $bestSellRate * Config::get( Config::SELL_RATE_FACTOR, Config::DEFAULT_SELL_RATE_FACTOR ),
+                                                     $targetPrecision );
+
+    if ( $reducedSellRate * $sellAmount < $target->getSmallestOrderSize( $tradeable, $currency, 'sell' ) ) {
+      $reducedSellRate = $this->roundPriceToPrecision( $target->getSmallestOrderSize( $tradeable, $currency, 'sell' ) / $sellAmount + 0.00000001,
+                                                       $targetPrecision );
+    }
+
+    if ( !is_null( $targetLimits[ 'price' ][ 'min' ] ) &&
+         floatval( $targetLimits[ 'price' ][ 'min' ] ) > $reducedSellRate ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: SELL PRICE IS BELOW EXCHANGE MINIMUM THRESHOLD\n" );
+      return false;
+    }
+
+    if ( !is_null( $targetLimits[ 'price' ][ 'max' ] ) &&
+         floatval( $targetLimits[ 'price' ][ 'max' ] ) < $reducedSellRate ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: SELL PRICE IS ABOVE EXCHANGE MAXIMUM THRESHOLD\n" );
+      return false;
+    }
+
+    if ( !$this->checkIncreasedBuyRate( $increasedBuyRate, $reducedSellRate, $sourceLimits, $orderInfo ) ) {
       return false;
     }
 
     $orderInfo .= "= TRADE ============================================\n";
-    $orderInfo .= " SELL ORDER : $sellAmount $tradeable @ $reducedSellRate $currency\n";
-    $orderInfo .= "  BUY ORDER : $tradeAmount $tradeable @ $increasedBuyRate $currency\n";
+    $orderInfo .= sprintf( " SELL ORDER : %s %s @ %s %s\n",
+                           formatBTC( $sellAmount ), $tradeable,
+                           formatBTC( $reducedSellRate ), $currency );
+    $orderInfo .= sprintf( "  BUY ORDER : %s %s @ %s %s\n",
+                           formatBTC( $tradeAmount ), $tradeable,
+                           formatBTC( $increasedBuyRate ), $currency );
     $orderInfo .= "\n";
     logg( $orderInfo );
 
     $undersellProtection = Config::get( Config::UNDERSELL_PROTECTION, Config::DEFAULT_UNDERSELL_PROTECTION );
 
+    $tradesMade = array( );
     $sellOrderID = $target->sell( $tradeable, $currency, $reducedSellRate, $sellAmount );
     $buyOrderID = null;
     if ( is_null( $sellOrderID ) ) {
       logg( "Sell order failed, we will not attempt a buy order to avoid incurring a loss." );
-      $buyOrderID = null;
     } else {
       logg( "Placed sell order (" . $target->getName() . " ID: $sellOrderID)" );
+      $tradesMade[ $target->getID() ] = array(
+        $tradeable => -$sellAmount,
+      );
 
       $tradesSum = 0;
+      $averageSellRate = 0;
+      $priceAdjustment = 0;
       if ( $undersellProtection ) {
-        $target->refreshWallets();
+        logg( "Waiting for order execution..." );
+        sleep( 0.1 * Config::get( Config::ORDER_CHECK_DELAY, Config::DEFAULT_ORDER_CHECK_DELAY ) );
+        if ( !is_null( $sellOrderID ) &&
+             $target->cancelOrder( $sellOrderID ) ) {
+          logg( "A sell order hasn't been filled. If this happens regulary you should increase the " . Config::ORDER_CHECK_DELAY . " setting!", true );
+        }
+
+        $target->refreshWallets( $tradesMade );
 
         $sellTrades = $this->tradeMatcher->handlePostTradeTasks( $this, $target, $tradeable, $currency, 'sell',
                                                                  $sellOrderID, $sellAmount );
         $tradesSum = array_reduce( $sellTrades, 'sumOfAmount', 0 );
+        $averageSellRate = $tradesSum == 0 ? $reducedSellRate :
+                             array_reduce( $sellTrades, 'sumOfAmountTimesRate', 0 ) / $tradesSum;
+        // Price adjustment is the difference of the sale price to the price that we intended to sell at.
+        $priceAdjustment = formatBTC( $averageSellRate ) - $reducedSellRate;
       }
 
       if ( $undersellProtection && floatval( $tradesSum ) == 0 ) {
         logg( "Sell order not fullfilled, we will not attempt a buy order to avoid incurring a loss." );
-        $buyOrderID = null;
+        $sellOrderID = null;
       } else {
         if ( $undersellProtection && $tradesSum != $sellAmount ) {
           logg( sprintf( "Warning: Meant to sell %s but managed to only sell %s",
                          formatBTC( $sellAmount ), formatBTC( $tradesSum ) ) );
 
           // Adjust $tradeAmount according to how much we managed to sell.
-          $tradeAmount = $tradesSum + $txFee;
+          if ( is_null( $sourceLimits[ 'amount' ][ 'min' ] ) ) {
+            $tradeAmount = $tradesSum + $txFee;
+          } else {
+            $tradeAmount = min( $tradesSum + $txFee,
+                                $sourceLimits[ 'amount' ][ 'min' ] );
+          }
+
+          if ( !$this->checkTradeAmount( $tradeAmount, $sourceLimits, $orderInfo ) ) {
+            return false;
+          }
+        }
+        // Ignore non-negative price adjustments, since if we manage to sell at a higher price than we
+        // expected, we can still attempt to buy at the price that we intended to buy at while making
+        // potentially more profits!
+        if ( $undersellProtection && $priceAdjustment < 0 ) {
+          if ( $increasedBuyRate + $priceAdjustment >= $bestBuyRate ) {
+	    logg( sprintf( "Warning: Meant to sell at %s but instead sold at %s, so adjusting the buy rate by %s.",
+			   formatBTC( $reducedSellRate ), formatBTC( $averageSellRate ),
+			   formatBTC( $priceAdjustment ) ) );
+
+            if ( is_null( $sourceLimits[ 'price' ][ 'min' ] ) ) {
+              $increasedBuyRate += $priceAdjustment;
+            } else {
+              $increasedBuyRate = min( $increasedBuyRate + $priceAdjustment,
+                                       $sourceLimits[ 'price' ][ 'min' ] );
+            }
+
+            if ( !$this->checkIncreasedBuyRate( $increasedBuyRate, $reducedSellRate,
+                                                $sourceLimits, $orderInfo ) ) {
+              return false;
+            }
+          }
         }
 
         for ( $i = 0; $i < 5; ++ $i ) {
@@ -381,13 +485,19 @@ class Arbitrator {
           break;
         }
 
-        if ( !is_null( $sellOrderID ) &&
-             $target->cancelOrder( $sellOrderID ) ) {
-          logg( "A sell order hasn't been filled. If this happens regulary you should increase the " . Config::ORDER_CHECK_DELAY . " setting!", true );
+        if ( !$undersellProtection ) {
+          if ( !is_null( $sellOrderID ) &&
+               $target->cancelOrder( $sellOrderID ) ) {
+            logg( "A sell order hasn't been filled. If this happens regulary you should increase the " . Config::ORDER_CHECK_DELAY . " setting!", true );
+          }
         }
         if ( !is_null( $buyOrderID ) &&
              $source->cancelOrder( $buyOrderID ) ) {
           logg( "A buy order hasn't been filled. If this happens regulary you should increase the " . Config::ORDER_CHECK_DELAY . " setting!", true );
+        } else {
+          $tradesMade[ $source->getID() ] = array(
+            $tradeable => $tradeAmount,
+          );
         }
       }
     }
@@ -401,9 +511,9 @@ class Arbitrator {
 
       logg( "Checking trade results ($i)..." );
 
-      $source->refreshWallets();
+      $source->refreshWallets( $tradesMade );
       if ( !$undersellProtection || $i != 1 ) {
-        $target->refreshWallets();
+        $target->refreshWallets( $tradesMade );
       }
 
       $buyTrades = $this->tradeMatcher->handlePostTradeTasks( $this, $source, $tradeable, $currency, 'buy',
@@ -411,6 +521,10 @@ class Arbitrator {
       if ( !$undersellProtection || $i != 1 ) {
         $sellTrades = $this->tradeMatcher->handlePostTradeTasks( $this, $target, $tradeable, $currency, 'sell',
                                                                  $sellOrderID, $sellAmount );
+      }
+
+      if ( !is_null( $buyOrderID ) ) {
+        $boughtAmount = min( $boughtAmount, array_reduce( $buyTrades, 'sumOfAmount', 0 ) );
       }
 
       $totalCost = is_null( $buyOrderID ) ? 0 :
@@ -471,7 +585,49 @@ class Arbitrator {
 
   }
 
-  function simulateTrade( $source, $target, $amount ) {
+  private function checkTradeAmount( $tradeAmount, $sourceLimits, $orderInfo ) {
+
+    if ( !is_null( $sourceLimits[ 'amount' ][ 'min' ] ) &&
+         floatval( $sourceLimits[ 'amount' ][ 'min' ] ) > $tradeAmount ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: BUY AMOUNT IS BELOW EXCHANGE MINIMUM THRESHOLD\n" );
+      return false;
+    }
+
+    if ( !is_null( $sourceLimits[ 'amount' ][ 'max' ] ) &&
+         floatval( $sourceLimits[ 'amount' ][ 'max' ] ) < $tradeAmount ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: BUY AMOUNT IS ABOVE EXCHANGE MAXIMUM THRESHOLD\n" );
+      return false;
+    }
+
+    return true;
+
+  }
+
+  private function checkIncreasedBuyRate( $increasedBuyRate, $reducedSellRate, $sourceLimits, $orderInfo ) {
+
+    if ( !is_null( $sourceLimits[ 'price' ][ 'min' ] ) &&
+         floatval( $sourceLimits[ 'price' ][ 'min' ] ) > $increasedBuyRate ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: BUY PRICE IS BELOW EXCHANGE MINIMUM THRESHOLD\n" );
+      return false;
+    }
+
+    if ( !is_null( $sourceLimits[ 'price' ][ 'max' ] ) &&
+         floatval( $sourceLimits[ 'price' ][ 'max' ] ) < $increasedBuyRate ) {
+      logg( $orderInfo . "NOT ENTERING TRADE: BUY PRICE IS ABOVE EXCHANGE MAXIMUM THRESHOLD\n" );
+      return false;
+    }
+
+    if ( $reducedSellRate <= $increasedBuyRate ) {
+      logg( $orderInfo . sprintf( "NOT ENTERING TRADE: REDUCED SELL RATE %s IS BELOW INCREASED BUY RATE %s",
+                                  formatBTC( $reducedSellRate ), formatBTC( $increasedBuyRate ) ) );
+      return false;
+    }
+
+    return true;
+
+  }
+
+  function simulateTrade( $source, $target, $amount, $currency ) {
 
     // A quick simulation to check the outcome of the trade
 
@@ -479,25 +635,64 @@ class Arbitrator {
     $sourceX = $source->getSource();
     $targetX = $target->getSource();
 
+    $sourceLimits = $sourceX->getLimits( $tradeable, $currency );
+    $targetLimits = $targetX->getLimits( $tradeable, $currency );
+
+    $sourcePrecision = $sourceX->getPrecision( $tradeable, $currency );
+    $targetPrecision = $targetX->getPrecision( $tradeable, $currency );
+
     $sourceAsk = $source->getBestAsk();
     $targetBid = $target->getBestBid();
 
-    $price = $sourceX->addFeeToPrice( $amount * $sourceAsk->getPrice() );
-    $receivedAmount = $sourceX->deductFeeFromAmountBuy( $amount );
-    if ( $price < $sourceX->getSmallestOrderSize() ) {
+    if ( ( !is_null( $sourceLimits[ 'amount' ][ 'min' ] ) &&
+           floatval( $sourceLimits[ 'amount' ][ 'min' ] ) > $amount ) ||
+         ( !is_null( $sourceLimits[ 'amount' ][ 'max' ] ) &&
+           floatval( $sourceLimits[ 'amount' ][ 'max' ] ) < $amount ) ) {
       return 0;
     }
 
-    $txFee = $this->coinManager->getSafeTxFee( $sourceX, $tradeable, $receivedAmount );
+    $amount = $this->roundAmountToPrecision( $amount, $sourcePrecision );
+    $askPrice = $this->roundPriceToPrecision( $sourceAsk->getPrice(), $sourcePrecision );
 
-    $arrivedAmount = $receivedAmount - $txFee;
+    $price = $sourceX->addFeeToPrice( $amount * $askPrice, $tradeable, $currency );
+    $receivedAmount = $sourceX->deductFeeFromAmountBuy( $amount, $tradeable, $currency );
+    if ( $price < $sourceX->getSmallestOrderSize( $tradeable, $currency, 'buy' ) ) {
+      return 0;
+    }
 
-    $receivedPrice = $targetX->deductFeeFromAmountSell( $arrivedAmount * $targetBid->getPrice() );
-    if ( $receivedPrice < $targetX->getSmallestOrderSize() ) {
+    $withdrawFee = $this->coinManager->getSafeWithdrawFee( $sourceX, $tradeable, $receivedAmount );
+    $depositFee = $this->coinManager->getSafeDepositFee( $targetX, $tradeable, $receivedAmount );
+    $txFee = $depositFee + $withdrawFee;
+
+    $arrivedAmount = $this->roundAmountToPrecision( $receivedAmount - $txFee, $targetPrecision );
+    $bidPrice = $this->roundPriceToPrecision( $targetBid->getPrice(), $targetPrecision );
+
+    if ( ( !is_null( $targetLimits[ 'amount' ][ 'min' ] ) &&
+           floatval( $targetLimits[ 'amount' ][ 'min' ] ) > $arrivedAmount ) ||
+         ( !is_null( $targetLimits[ 'amount' ][ 'max' ] ) &&
+           floatval( $targetLimits[ 'amount' ][ 'max' ] ) < $arrivedAmount ) ) {
+      return 0;
+    }
+
+    $receivedPrice = $targetX->deductFeeFromAmountSell( $arrivedAmount * $bidPrice,
+                                                        $tradeable, $currency );
+    if ( $receivedPrice < $targetX->getSmallestOrderSize( $tradeable, $currency, 'sell' ) ) {
       return 0;
     }
 
     return formatBTC( $receivedPrice - $price );
+
+  }
+
+  private function roundAmountToPrecision( $amount, $precision ) {
+
+    return floatval( sprintf( '%.' . $precision[ 'amount' ] . 'f', $amount ) );
+
+  }
+
+  private function roundPriceToPrecision( $price, $precision ) {
+
+    return floatval( sprintf( '%.' . $precision[ 'price' ] . 'f', $price ) );
 
   }
 
@@ -523,7 +718,8 @@ class Arbitrator {
     foreach ( $this->exchanges as $exchange ) {
       $exchange->refreshExchangeData();
 
-      logg( count( $exchange->getTradeablePairs() ) . " tradeable pairs @ " . $exchange->getName() );
+      logg( "tradeable pairs: " . count( $exchange->getWithdrawablePairs() ) . " of " .
+            count( $exchange->getDepositablePairs() ) . " @ " . $exchange->getName() );
     }
 
     $this->refreshProfitablePairsOfTheDay();
@@ -541,8 +737,6 @@ class Arbitrator {
 
   public function run() {
 
-    $this->errorCounter = 0;
-
     $this->eventLoop->run();
 
   }
@@ -551,17 +745,10 @@ class Arbitrator {
 
     try {
       $this->loop();
-      $this->errorCounter = 0;
     }
     catch ( Exception $ex ) {
-      $this->errorCounter++;
-      logg( "Error during main loop: " . $ex->getMessage() . "\n" . $ex->getTraceAsString(), $this->errorCounter == 10 );
+      logg( "Error during main loop: " . $ex->getMessage() . "\n" . $ex->getTraceAsString() );
     }
-
-    $self = $this;
-    $this->eventLoop->addTimer( 1, function() use($self) {
-      $self->innerRun();
-    } );
 
   }
 

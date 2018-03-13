@@ -55,8 +55,37 @@ function compareByTime( $row1, $row2 ) {
   return $row1[ 'time' ] - $row2[ 'time' ];
 }
 
+function compareByTimeStamp( $row1, $row2 ) {
+  return $row1[ 'timestamp' ] - $row2[ 'timestamp' ];
+}
+
 function sumOfAmount( $carry, $item ) {
   return $carry + $item[ 'amount' ];
+}
+
+
+function sumOfAmountTimesRate( $carry, $item ) {
+  return $carry + $item[ 'amount' ] * $item[ 'rate' ];
+}
+
+function getCurrency( $item ) {
+  return $item[ 'Currency' ];
+}
+
+function generateNonce( $id ) {
+  static $previousNonce = array( );
+  if ( !isset( $previousNonce[ $id ] ) ) {
+    $previousNonce[ $id ] = 0;
+  }
+
+  // Try the current time, if we're getting called too fast, step up one by one.
+  $nonce = floor( microtime( true ) * 1000000);
+  if ( $nonce <= $previousNonce[ $id ] ) {
+    $nonce = $previousNonce[ $id ] + 1;
+  }
+
+  $previousNonce[ $id ] = $nonce;
+  return $nonce;
 }
 
 function installDirectoryDirty() {

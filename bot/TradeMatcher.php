@@ -75,7 +75,8 @@ class TradeMatcher {
     $currencySold = 0;
     $sellFee = 0;
 
-    $tradeableTransferFee = 0;
+    $tradeableDepositFee = 0;
+    $tradeableWithdrawFee = 0;
 
     foreach ( $buyTrades as $trade ) {
       if ( !is_null( $tradeable ) && $tradeable != $trade[ 'tradeable' ] ) {
@@ -99,9 +100,9 @@ class TradeMatcher {
       // Fee is positive for "buy" trades.
       $buyFee = -$trade[ 'fee' ];
 
-      $boughtAmount = $source->deductFeeFromAmountBuy( $trade[ 'amount' ] );
-      $txFee = $cm->getSafeTxFee( $source, $trade[ 'tradeable' ], $boughtAmount );
-      $tradeableTransferFee = max( $tradeableTransferFee, $txFee );
+      $boughtAmount = $source->deductFeeFromAmountBuy( $trade[ 'amount' ], $tradeable, $currency );
+      $tradeableWithdrawFee = $cm->getSafeWithdrawFee( $source, $trade[ 'tradeable' ], $boughtAmount );
+      $tradeableDepositFee = $cm->getSafeDepositFee( $target, $trade[ 'tradeable' ], $boughtAmount );
     }
     foreach ( $sellTrades as $trade ) {
       if ( !is_null( $tradeable ) && $tradeable != $trade[ 'tradeable' ] ) {
@@ -124,10 +125,6 @@ class TradeMatcher {
       $tradeableSold += $trade[ 'amount' ];
       // Fee is negative for "buy" trades.
       $sellFee = $trade[ 'fee' ];
-
-      $soldAmount = $target->deductFeeFromAmountSell( $trade[ 'amount' ] );
-      $txFee = $cm->getSafeTxFee( $target, $trade[ 'tradeable' ], $soldAmount );
-      $tradeableTransferFee = max( $tradeableTransferFee, $txFee );
     }
 
     $currencyBought = $rateTimesAmountBuy;
@@ -142,7 +139,7 @@ class TradeMatcher {
     $rateBuy = ($tradeableBought > 0) ? ($rateTimesAmountBuy / $tradeableBought) : 0;
     $rateSell = ($tradeableSold > 0) ? ($rateTimesAmountSell / $tradeableSold) : 0;
 
-    $currencyTransferFee = $tradeableTransferFee * $rateSell;
+    $currencyTransferFee = ($tradeableWithdrawFee + $tradeableDepositFee) * $rateSell;
     $currencyRevenue = $currencySold - $currencyBought;
     $currencyProfitLoss = $currencyRevenue - $currencyTransferFee + $sellFee + $buyFee;
 
@@ -150,13 +147,14 @@ class TradeMatcher {
                               $rawTradeIDsBuy, $tradeIDsBuy, $rawTradeIDsSell, $tradeIDsSell,
                               $rateBuy, $rateSell, $tradeableBought, $tradeableSold,
                               $currencyBought, $currencySold, $currencyRevenue, $currencyProfitLoss,
-                              $tradeableTransferFee, $currencyTransferFee, $buyFee, $sellFee );
+                              $tradeableWithdrawFee + $tradeableDepositFee, $currencyTransferFee,
+                              $buyFee, $sellFee );
 
 
     return $currencyProfitLoss;
   }
 
-  public function matchTradesConsideringPendingTransfers( $trades, $tradeable, $exchange, $tradeAmount ) {
+  public function matchTradesConsideringPendingTransfers( $trades, $tradeable, $currency, $exchange, $tradeAmount ) {
 
     $tradesSum = array_reduce( $trades, 'sumOfAmount', 0 );
 
@@ -165,15 +163,21 @@ class TradeMatcher {
 
 
     return $tradesSum == 0 ||
-           abs( abs( $tradesSum / $tradeAmount ) - 1 ) <= $exchange->addFeeToPrice( 1 );
+           abs( abs( $tradesSum / $tradeAmount ) - 1 ) <=
+                  $exchange->addFeeToPrice( 1, $tradeable, $currency );
 
   }
 
   function handlePostTradeTasks( &$arbitrator, &$exchange, $coin, $currency, $type,
                                  $orderID, $tradeAmount ) {
 
-    $trades = $exchange->getRecentOrderTrades( $arbitrator, $coin, $currency, $type,
-                                               $orderID, $tradeAmount );
+    $trades = [ ];
+    try {
+      $trades = $exchange->getRecentOrderTrades( $arbitrator, $coin, $currency, $type,
+                                                 $orderID, $tradeAmount );
+    } catch ( Exception $ex ) {
+      logg( "WARNING: Caught exceptin while calling getRecentOrderTrades(): " . $ex->getMessage() );
+    }
     foreach ( $trades as $trade ) {
       $arbitrator->getTradeMatcher()->saveTrade( $exchange->getID(), $type, $trade[ 'tradeable' ],
                                                  $trade[ 'currency' ], $trade );

@@ -21,6 +21,9 @@ class Config {
   const MAX_TX_FEE_ALLOWED = 'expert.max-tx-fee-allowed';
   const DEFAULT_MAX_TX_FEE_ALLOWED = 0.00001;
   //
+  const NEAR_ZERO_BTC_VALUE = 'expert.near-zero-btc-value';
+  const DEFAULT_NEAR_ZERO_BTC_VALUE = 0.02;
+  //
   const MAX_MIN_CONFIRMATIONS_ALLOWED = 'expert.max-min-confirmations-allowed';
   const DEFAULT_MAX_MIN_CONFIRMATIONS_ALLOWED = 50;
   //
@@ -57,11 +60,17 @@ class Config {
   const INTERVAL_STUCK_DETECTION = 'expert.interval-stuck-detection';
   const DEFAULT_INTERVAL_STUCK_DETECTION = 12;
   //
+  const INTERVAL_DUPLICATE_DETECTION = 'expert.interval-duplicate-detection';
+  const DEFAULT_INTERVAL_DUPLICATE_DETECTION = 12;
+  //
   const INTERVAL_UNUSED_COIN_DETECTION = 'expert.interval-unused-coin-detection';
   const DEFAULT_INTERVAL_UNUSED_COIN_DETECTION = 24;
   //
   const INTERVAL_DB_CLEANUP = 'expert.interval-db-cleanup';
   const DEFAULT_INTERVAL_DB_CLEANUP = 2;
+  //
+  const INTERVAL_CURRENCY_AGGRESSIVE_BALANCE = 'expert.interval-currency-aggressive-balance';
+  const DEFAULT_INTERVAL_CURRENCY_AGGRESSIVE_BALANCE = 5;
   //
   const ALLOW_INSECURE_UI = 'expert.allow-insecure-ui';
   const DEFAULT_ALLOW_INSECURE_UI = false;
@@ -120,6 +129,9 @@ class Config {
   const MODULE_TRADE = 'modules.trade';
   const DEFAULT_MODULE_TRADE = true;
   //
+  const MODULE_AUTOBALANCE = 'modules.auto-balance';
+  const DEFAULT_MODULE_AUTOBALANCE = true;
+  //
   const MODULE_LIQUIDATE = 'modules.coin-liquidation';
   const DEFAULT_MODULE_LIQUIDATE = false;
   //
@@ -131,6 +143,9 @@ class Config {
   //
   const MODULE_STUCK_DETECTION = 'modules.stuck-detection';
   const DEFAULT_MODULE_STUCK_DETECTION = true;
+  //
+  const MODULE_DUPLICATE_DETECTION = 'modules.duplicate-detection';
+  const DEFAULT_MODULE_DUPLICATE_DETECTION = true;
   //
   const MODULE_UNUSED_COINS_DETECTION = 'modules.unused-coins-detection';
   const DEFAULT_MODULE_UNUSED_COINS_DETECTION = true;
@@ -244,9 +259,11 @@ class Config {
       self::BLOCKED_COINS,
       self::MODULE_TRADE,
       self::MODULE_AUTOBUY,
+      self::MODULE_AUTOBALANCE,
       self::MODULE_LIQUIDATE,
       self::MODULE_TAKE_PROFIT,
       self::MODULE_STUCK_DETECTION,
+      self::MODULE_DUPLICATE_DETECTION,
       self::MODULE_UNUSED_COINS_DETECTION,
       self::MAX_BUY,
       self::TAKE_PROFIT_ADDRESS,
@@ -330,9 +347,11 @@ class Config {
       self::BLOCKED_COINS,
       self::MODULE_TRADE,
       self::MODULE_AUTOBUY,
+      self::MODULE_AUTOBALANCE,
       self::MODULE_LIQUIDATE,
       self::MODULE_TAKE_PROFIT,
       self::MODULE_STUCK_DETECTION,
+      self::MODULE_DUPLICATE_DETECTION,
       self::MODULE_UNUSED_COINS_DETECTION,
       self::MAX_BUY,
       self::TAKE_PROFIT_ADDRESS,

@@ -1,15 +1,5 @@
 <?php
 
-class CoinEntry {
-
-  public $amount;
-  public $coin;
-  public $exchange;
-  public $profit;
-  public $time;
-
-}
-
 class CoinManager {
 
   //
@@ -18,8 +8,10 @@ class CoinManager {
   const STAT_NEXT_MANAGEMENT = "next_management";
   const STAT_NEXT_TAKE_PROFIT = "next_take_profit";
   const STAT_NEXT_STUCK_DETECTION = "next_stuck_detection";
+  const STAT_NEXT_DUPLICATE_DETECTION = "next_duplicate_detection";
   const STAT_NEXT_UNUSED_COIN_DETECTION = "next_unused_coin_detection";
   const STAT_NEXT_DB_CLEANUP = "next_db_cleanup";
+  const STAT_NEXT_CURRENCY_AGGRESSIVE_BALANCE_ALLOWED = "next_currency_aggressive_balance_allowed";
   const STAT_BOT_AGE = "bot_age";
 
   //
@@ -52,32 +44,38 @@ class CoinManager {
       //
       if ( $stats[ self::STAT_NEXT_MANAGEMENT ] <= time() ) {
         //
-        $stats[ self::STAT_NEXT_MANAGEMENT ] = time() + Config::get( Config::INTERVAL_MANAGEMENT, Config::DEFAULT_INTERVAL_MANAGEMENT ) * 1800;
         self::manageWallets( $arbitrator );
+        $stats[ self::STAT_NEXT_MANAGEMENT ] = time() + Config::get( Config::INTERVAL_MANAGEMENT, Config::DEFAULT_INTERVAL_MANAGEMENT ) * 1800;
         //
       }
       else if ( $stats[ self::STAT_NEXT_TAKE_PROFIT ] <= time() ) {
         //
-        $stats[ self::STAT_NEXT_TAKE_PROFIT ] = time() + Config::get( Config::INTERVAL_TAKE_PROFIT, Config::DEFAULT_INTERVAL_TAKE_PROFIT ) * 3600;
         self::takeProfit();
+        $stats[ self::STAT_NEXT_TAKE_PROFIT ] = time() + Config::get( Config::INTERVAL_TAKE_PROFIT, Config::DEFAULT_INTERVAL_TAKE_PROFIT ) * 3600;
         //
       }
       else if ( $stats[ self::STAT_NEXT_STUCK_DETECTION ] <= time() ) {
         //
-        $stats[ self::STAT_NEXT_STUCK_DETECTION ] = time() + Config::get( Config::INTERVAL_STUCK_DETECTION, Config::DEFAULT_INTERVAL_STUCK_DETECTION ) * 3600;
         self::stuckDetection();
+        $stats[ self::STAT_NEXT_STUCK_DETECTION ] = time() + Config::get( Config::INTERVAL_STUCK_DETECTION, Config::DEFAULT_INTERVAL_STUCK_DETECTION ) * 3600;
+        //
+      }
+      else if ( $stats[ self::STAT_NEXT_DUPLICATE_DETECTION ] <= time() ) {
+        //
+        self::duplicateDetection();
+        $stats[ self::STAT_NEXT_DUPLICATE_DETECTION ] = time() + Config::get( Config::INTERVAL_DUPLICATE_DETECTION, Config::DEFAULT_INTERVAL_DUPLICATE_DETECTION ) * 3600;
         //
       }
       else if ( $stats[ self::STAT_NEXT_UNUSED_COIN_DETECTION ] <= time() ) {
         //
-        $stats[ self::STAT_NEXT_UNUSED_COIN_DETECTION ] = time() + Config::get( Config::INTERVAL_UNUSED_COIN_DETECTION, Config::DEFAULT_INTERVAL_UNUSED_COIN_DETECTION ) * 3600;
         self::unusedCoinsDetection();
+        $stats[ self::STAT_NEXT_UNUSED_COIN_DETECTION ] = time() + Config::get( Config::INTERVAL_UNUSED_COIN_DETECTION, Config::DEFAULT_INTERVAL_UNUSED_COIN_DETECTION ) * 3600;
         //
       }
       else if ( $stats[ self::STAT_NEXT_DB_CLEANUP ] <= time() ) {
         //
-        $stats[ self::STAT_NEXT_DB_CLEANUP ] = time() + Config::get( Config::INTERVAL_DB_CLEANUP, Config::DEFAULT_INTERVAL_DB_CLEANUP ) * 3600;
         self::dbCleanup();
+        $stats[ self::STAT_NEXT_DB_CLEANUP ] = time() + Config::get( Config::INTERVAL_DB_CLEANUP, Config::DEFAULT_INTERVAL_DB_CLEANUP ) * 3600;
         //
       }
       else {
@@ -109,11 +107,17 @@ class CoinManager {
     if ( !key_exists( self::STAT_NEXT_STUCK_DETECTION, $stats ) ) {
       $stats[ self::STAT_NEXT_STUCK_DETECTION ] = time() + 24 * 3600;
     }
+    if ( !key_exists( self::STAT_NEXT_DUPLICATE_DETECTION, $stats ) ) {
+      $stats[ self::STAT_NEXT_DUPLICATE_DETECTION ] = time() + 24 * 3600;
+    }
     if ( !key_exists( self::STAT_NEXT_UNUSED_COIN_DETECTION, $stats ) ) {
       $stats[ self::STAT_NEXT_UNUSED_COIN_DETECTION ] = time() + 24 * 3600;
     }
     if ( !key_exists( self::STAT_NEXT_DB_CLEANUP, $stats ) ) {
       $stats[ self::STAT_NEXT_DB_CLEANUP ] = time() + 7 * 24 * 3600;
+    }
+    if ( !key_exists( self::STAT_NEXT_CURRENCY_AGGRESSIVE_BALANCE_ALLOWED, $stats ) ) {
+      $stats[ self::STAT_NEXT_CURRENCY_AGGRESSIVE_BALANCE_ALLOWED ] = 0;
     }
     if ( !key_exists( self::STAT_BOT_AGE, $stats ) ) {
       $stats[ self::STAT_BOT_AGE ] = time();
@@ -150,11 +154,11 @@ class CoinManager {
       foreach ( $wallets as $coin => $value ) {
 
         $balance = formatBTC( $value );
-	if ( isset( $balances[ $coin ] ) ) {
-	  $balances[ $coin ] += $value;
-	} else {
-	  $balances[ $coin ] = $value;
-	}
+        if ( isset( $balances[ $coin ] ) ) {
+          $balances[ $coin ] += $value;
+        } else {
+          $balances[ $coin ] = $value;
+        }
 
         if ( Config::isCurrency( $coin ) ) {
           Database::saveSnapshot( $coin, $balance, $balance, 0, $exid, $time );
@@ -181,30 +185,21 @@ class CoinManager {
           // Retrieve average exchange rates for this coin:
           $averageRate = Database::getAverageRate( $coin );
 
-          // Calculate the maximum transaction fee and confirmation time across exchanges.
-          $maxTxFee = 0;
-          $maxConfTime = 0;
-          foreach ( $this->exchanges as $exchange ) {
-            $fee = abs( $exchange->getTransferFee( $coin, 1 ) );
-            $conf = $exchange->getConfirmationTime( $coin );
-            if ($maxTxFee < $fee) {
-              $maxTxFee = $fee;
-            }
-            if ($maxConfTime < $conf) {
-              $maxConfTime = $conf;
-            }
-          }
-          $maxTxFee *= $averageRate;
+          $depositFee = abs( $exchange->getDepositFee( $coin, 1 ) * $averageRate );
+          $withdrawFee = abs( $exchange->getWithdrawFee( $coin, 1 ) * $averageRate );
+          $confTime = $exchange->getConfirmationTime( $coin );
 
-          if ($maxTxFee < Config::get( Config::MAX_TX_FEE_ALLOWED, Config::DEFAULT_MAX_TX_FEE_ALLOWED ) &&
-              $maxConfTime < Config::get( Config::MAX_MIN_CONFIRMATIONS_ALLOWED, Config::DEFAULT_MAX_MIN_CONFIRMATIONS_ALLOWED ) ) {
+          if ($depositFee < Config::get( Config::MAX_TX_FEE_ALLOWED, Config::DEFAULT_MAX_TX_FEE_ALLOWED ) &&
+              $withdrawFee < Config::get( Config::MAX_TX_FEE_ALLOWED, Config::DEFAULT_MAX_TX_FEE_ALLOWED ) &&
+              $confTime < Config::get( Config::MAX_MIN_CONFIRMATIONS_ALLOWED, Config::DEFAULT_MAX_MIN_CONFIRMATIONS_ALLOWED ) ) {
             $maxTradeSize = Config::get( Config::MAX_TRADE_SIZE, Config::DEFAULT_MAX_TRADE_SIZE );
             $balanceFactor = Config::get( Config::BALANCE_FACTOR, Config::DEFAULT_BALANCE_FACTOR );
   
             $desiredBalance = formatBTC( $maxTradeSize / $averageRate * $balanceFactor );
             $diff = abs( $desiredBalance - $balance );
             // Only allow a diff if the need is fulfillable:
-            if ( $diff * $averageRate < $exchange->getSmallestOrderSize() ) {
+            if ( $diff * $averageRate < $exchange->getSmallestOrderSize( $coin, 'BTC', 'buy' ) &&
+                 $diff * $averageRate < $exchange->getSmallestOrderSize( $coin, 'BTC', 'sell' ) ) {
               $desiredBalance = $balance;
             }
           }
@@ -231,7 +226,7 @@ class CoinManager {
 
   }
 
-  private function balance( $coin, $skipUsageCheck = false ) {
+  private function balance( $coin, $skipUsageCheck = false, $safetyFactorArg = 0.01 ) {
 
     logg( "balance($coin)" );
     if ( Config::isBlocked( $coin ) ) {
@@ -287,7 +282,7 @@ class CoinManager {
     $negativeExchanges = [ ];
 
     $minXFER = 0;
-    $safetyFactor = 0.01;
+    $safetyFactor = $safetyFactorArg;
     if ( $coin == 'BTC' ) {
       $minXFER = Config::get( Config::MIN_BTC_XFER, Config::DEFAULT_MIN_BTC_XFER );
       // Be a bit more conservative with BTC, since it's our profits after all!
@@ -295,13 +290,18 @@ class CoinManager {
                                     Config::DEFAULT_BTC_XFER_SAFETY_FACTOR );
     }
     $oneIsZero = false;
+    $oneIsNearZero = false; // Only used for BTC
+    $nearZeroThreshold = Config::get( Config::NEAR_ZERO_BTC_VALUE, Config::DEFAULT_NEAR_ZERO_BTC_VALUE );
     foreach ( $exchanges as $exchange ) {
       // Allow max 1% of coin amount to be transfer fee:
-      $minXFER = max( $minXFER, $this->getSafeTxFee( $exchange, $coin, $averageCoins ) / $safetyFactor );
+      $minXFER = max( $minXFER, $this->getSafeWithdrawFee( $exchange, $coin, $averageCoins ) / $safetyFactor );
 
       $wallets = $exchange->getWallets();
       if ( $wallets[ $coin ] == 0 ) {
         $oneIsZero = true;
+      }
+      if ( $coin == 'BTC' && $wallets[ $coin ] <= $nearZeroThreshold ) {
+        $oneIsNearZero = true;
       }
     }
     logg( "XFER THRES.: $minXFER $coin" );
@@ -336,6 +336,26 @@ class CoinManager {
     }
 
     if ( count( $positiveExchanges ) == 0 || count( $negativeExchanges ) == 0 ) {
+      if ( $oneIsNearZero && count( $exchanges ) > 2 ) {
+        // While balancing currencies with more than 2 exchanges, if we get to a situation
+        // where one of our exchanges is running out of its balance but we have been unable
+        // to perform a rebalancing, if we just give up we may end up stuck in this local
+        // minima for quite a while.  So to avoid this, we try to be less conservative and
+        // relax our safety factor a bit to see if we'll manage to rebalance that way.
+        if ( $safetyFactorArg <= 0.09 && // Don't lose more than 10% of our balance in transfers!
+             // Throttle how often this feature kicks in.
+             time() >= $this->stats[ self::STAT_NEXT_CURRENCY_AGGRESSIVE_BALANCE_ALLOWED ] ) {
+          $this->stats[ self::STAT_NEXT_CURRENCY_AGGRESSIVE_BALANCE_ALLOWED ] = time() +
+            Config::get( Config::INTERVAL_CURRENCY_AGGRESSIVE_BALANCE,
+                         Config::DEFAULT_INTERVAL_CURRENCY_AGGRESSIVE_BALANCE ) * 1800;
+          Database::saveStats( $this->stats );
+
+          logg( sprintf( "Failed to rebalance with a safety factor of %d%%, trying %d%% now...",
+                         floor( $safetyFactorArg * 100 ),
+                         floor( ( $safetyFactorArg + 0.01 ) * 100 ) ) );
+          return $this->balance( $coin, $skipUsageCheck, $safetyFactorArg + 0.01 );
+        }
+      }
       logg( "No exchange in need or available to give" );
       return;
     }
@@ -392,6 +412,19 @@ class CoinManager {
     logg( "stuckDetection()" );
     foreach ( $this->exchanges as $exchange ) {
       $exchange->detectStuckTransfers();
+    }
+
+  }
+
+  private function duplicateDetection() {
+
+    if ( !Config::get( Config::MODULE_DUPLICATE_DETECTION, Config::DEFAULT_MODULE_DUPLICATE_DETECTION ) ) {
+      return;
+    }
+
+    logg( "duplicateDetection()" );
+    foreach ( $this->exchanges as $exchange ) {
+      $exchange->detectDuplicateWithdrawals();
     }
 
   }
@@ -498,7 +531,7 @@ class CoinManager {
                                         Config::DEFAULT_BTC_XFER_SAFETY_FACTOR );
     foreach ( $this->exchanges as $exchange ) {
       // Allow max 1%/safetyFactor of coin amount to be transfer fee:
-      $minXFER = max( $minXFER, $this->getSafeTxFee( $exchange, 'BTC', $averageBTC ) / $safetyFactor );
+      $minXFER = max( $minXFER, $this->getSafeWithdrawFee( $exchange, 'BTC', $averageBTC ) / $safetyFactor );
     }
 
     $remainingProfit = formatBTC( $profit - $restockCash );
@@ -509,9 +542,10 @@ class CoinManager {
 
     logg( "Withdrawing profit: $remainingProfit BTC to $profitAddress", true );
     if ( $highestExchange->withdraw( 'BTC', $remainingProfit, $profitAddress ) ) {
-      $txFee = $this->getSafeTxFee( $highestExchange, 'BTC', $averageBTC );
+      $txFee = $this->getSafeWithdrawFee( $highestExchange, 'BTC', $averageBTC );
       Database::recordProfit( $remainingProfit - $txFee, 'BTC', $profitAddress, time() );
-      Database::saveWithdrawal( 'BTC', $remainingProfit, $profitAddress, $highestExchange->getID(), 0 );
+      Database::saveWithdrawal( 'BTC', $remainingProfit, $profitAddress, $highestExchange->getID(), 0,
+                                $highestExchange->getWithdrawFee( 'BTC', $remainingProfit ) );
 
       // -------------------------------------------------------------------------
       $restockFunds = $this->stats[ self::STAT_AUTOBUY_FUNDS ];
@@ -552,23 +586,32 @@ class CoinManager {
 
     logg( "Getting need..." );
 
+    $results = Database::getCurrentSimulatedProfitRate();
     $stats = Database::getWalletStats();
-    foreach ( $stats as $coin => $data ) {
+    foreach ( $results as $row ) {
 
+      $currency = $row[ 'currency' ];
+      $coin = $row[ 'coin' ];
+      if ( !Config::isCurrency( $currency ) ) {
+        logg( "Skipping: $currency is not a currency!" );
+        continue;
+      }
       if ( Config::isCurrency( $coin ) || Config::isBlocked( $coin ) ) {
         logg( "Skipping: $coin is blocked!" );
         continue;
       }
 
-      foreach ( $data as $exchangeID => $stat ) {
+      $exchangeID = $row[ 'ID_exchange_target'];
+      $stat = $stats[ $coin ][ $exchangeID ];
+      $exchange = $this->exchangesID[ $exchangeID ];
+      $balance = $allWallets[ $exchangeID ][ $coin ];
+      $desiredBalance = $stat[ 'desired_balance' ];
 
-        $exchange = $this->exchangesID[ $exchangeID ];
-        $balance = $allWallets[ $exchangeID ][ $coin ];
-        $desiredBalance = $stat[ 'desired_balance' ];
-
-        $diff = formatBTC( $desiredBalance - $balance );
-        if ( $diff > 0 ) {
-          logg( "Need $diff $coin @ " . $exchange->getName() );
+      $diff = formatBTC( $desiredBalance - $balance );
+      if ( $diff > 0 ) {
+        logg( "Need $diff $coin @ " . $exchange->getName() );
+        // We add an entry to the $needs array ratio times to get a weighted randomized autobuy function.
+        for ( $i = 0; $i < $row[ 'ratio' ]; $i++ ) {
           $needs[] = ['coin' => $coin, 'amount' => $diff, 'exchange' => $exchangeID ];
         }
       }
@@ -601,7 +644,7 @@ class CoinManager {
       $askAmount = $orderbook->getBestAsk()->getAmount();
       $buyAmount = formatBTC( min( $needAmount, min( $askAmount, $autobuyAmount / ($rate * 1.01) ) ) );
       $buyPrice = formatBTC( $buyAmount * $rate );
-      if ( $buyPrice < $exchange->getSmallestOrderSize() ) {
+      if ( $buyPrice < $exchange->getSmallestOrderSize( $coin, 'BTC', 'buy' ) ) {
         logg( "Not enough coins at top of the orderbook!" );
         continue;
       }
@@ -618,6 +661,14 @@ class CoinManager {
           logg( "Order executed!" );
           Database::saveManagement( $coin, $buyAmount, $rate, $exchange->getID() );
           $this->stats[ self::STAT_AUTOBUY_FUNDS ] = formatBTC( $autobuyFunds - $buyPrice );
+
+          // Make sure the wallets are updated for pending deposit calculations.
+          $tradesMade = array(
+            $exchange->getID() => array(
+              $coin => $buyAmount,
+            )
+          );
+          $exchange->refreshWallets( $tradesMade );
 
           $arbitrator->getTradeMatcher()->handlePostTradeTasks( $arbitrator, $exchange, $coin, 'BTC', 'buy',
                                                                 $orderID, $buyAmount );
@@ -647,6 +698,11 @@ class CoinManager {
   private function balanceAltcoins() {
 
     logg( "balanceAltcoins()" );
+
+    if ( !Config::get( Config::MODULE_AUTOBALANCE, Config::DEFAULT_MODULE_AUTOBALANCE ) ) {
+      logg( "Module disabled: Skipping balancing!" );
+      return;
+    }
 
     $allcoins = [ ];
     foreach ( $this->exchanges as $exchange ) {
@@ -749,7 +805,7 @@ class CoinManager {
       $bidAmount = $orderbook->getBestBid()->getAmount();
       $sellAmount = formatBTC( min( $liquidationAmount, $bidAmount ) );
       $sellPrice = formatBTC( $sellAmount * $rate );
-      if ( $sellPrice < $exchange->getSmallestOrderSize() ) {
+      if ( $sellPrice < $exchange->getSmallestOrderSize( $coin, 'BTC', 'sell' ) ) {
         logg( "Not enough coins at top of the orderbook!" );
         continue;
       }
@@ -765,6 +821,14 @@ class CoinManager {
           // Cancellation failed: Order has been executed!
           logg( "Order executed!" );
           Database::saveManagement( $coin, $sellAmount * -1, $rate, $exchange->getID() );
+
+          // Make sure the wallets are updated for pending deposit calculations.
+          $tradesMade = array(
+            $exchange->getID() => array(
+              $coin => -$sellAmount,
+            )
+          );
+          $exchange->refreshWallets( $tradesMade );
 
           $arbitrator->getTradeMatcher()->handlePostTradeTasks( $arbitrator, $exchange, $coin, 'BTC', 'sell',
                                                                 $orderID, $sellAmount );
@@ -784,17 +848,17 @@ class CoinManager {
 
   }
 
-  private function doWithdraw( $source, $coin, $amount, $address ) {
+  private function doWithdraw( $source, $coin, $amount, $address, $tag ) {
 
     try {
-      return $source->withdraw( $coin, $amount, $address );
+      return $source->withdraw( $coin, $amount, $address, $tag );
     }
     catch ( Exception $ex ) {
       // Perhaps the withdrawal was unsuccessful because of insufficient balance.
       // This can happen if the account only has $amount balance, in which case
       // we need to subtract the withdrawal fee.
-      $amount -= $source->getTransferFee( $coin, $amount );
-      return $source->withdraw( $coin, $amount, $address );
+      $amount -= $source->getWithdrawFee( $coin, $amount );
+      return $source->withdraw( $coin, $amount, $address, $tag );
     }
 
     return false;
@@ -803,25 +867,68 @@ class CoinManager {
 
   public function withdraw( $source, $target, $coin, $amount ) {
 
+    if ( !Config::isCurrency( $coin ) ) {
+      $limits = $source->getWithdrawLimits( $coin, 'BTC' );
+
+      if ( !is_null( $limits[ 'amount' ][ 'min' ] ) &&
+           floatval( $limits[ 'amount' ][ 'min' ] ) > $amount ) {
+        logg( sprintf( "[%s] Withdrawal amount %s below minimum trade amount %s",
+                       strtoupper( $source->getName() ),
+                       $amount, $limits[ 'amount' ][ 'min' ] ) );
+        return false;
+      }
+
+      if ( !is_null( $limits[ 'amount' ][ 'max' ] ) &&
+           floatval( $limits[ 'amount' ][ 'max' ] ) < $amount ) {
+        logg( sprintf( "[%s] Withdrawal amount %s above maximum trade amount %s",
+                       strtoupper( $source->getName() ),
+                       $amount, $limits[ 'amount' ][ 'max' ] ) );
+        return false;
+      }
+    }
+
+    $amount = formatBTC( $amount );
     logg( "Transfering $amount $coin " . $source->getName() . " => " . $target->getName() );
     $address = $target->getDepositAddress( $coin );
+    $tag = null;
+    if ( is_array( $address ) ) {
+      $tag = $address[ 1 ];
+      $address = $address[ 0 ];
+    }
     if ( is_null( $address ) || strlen( trim( $address ) ) == 0 ) {
       logg( "Invalid deposit address for " . $target->getName() . ", received: ". $address );
 
-      return;
+      return false;
     }
 
 
-    logg( "Deposit address: $address" );
-    if ( $this->doWithdraw( $source, $coin, $amount, trim( $address ) ) ) {
-      Database::saveWithdrawal( $coin, $amount, trim( $address ), $source->getID(), $target->getID() );
+    logg( "Deposit Address: $address, Memo: " . ( is_null( $tag ) ? "null" : $tag ) );
+    if ( $this->doWithdraw( $source, $coin, $amount, trim( $address ), $tag ) ) {
+      Database::saveWithdrawal( $coin, $amount, trim( $address ), $source->getID(), $target->getID(),
+                                $source->getWithdrawFee( $coin, $amount ) +
+                                $target->getDepositFee( $coin, $amount ) );
+
+      return true;
     }
+
+    return false;
 
   }
 
-  public function getSafeTxFee( $exchange, $tradeable, $amount ) {
+  public function getSafeDepositFee( $exchange, $tradeable, $amount ) {
 
-    $fee = $exchange->getTransferFee( $tradeable, $amount );
+    $fee = $exchange->getDepositFee( $tradeable, $amount );
+    if ( is_null( $fee ) ) {
+      $fee = 0;
+    }
+
+    return $fee;
+
+  }
+
+  public function getSafeWithdrawFee( $exchange, $tradeable, $amount ) {
+
+    $fee = $exchange->getWithdrawFee( $tradeable, $amount );
     if ( !is_null( $fee ) ) {
       return $fee;
     }
@@ -835,7 +942,7 @@ class CoinManager {
         continue;
       }
 
-      $txFee = $x->getTransferFee( $tradeable, $amount );
+      $txFee = $x->getWithdrawFee( $tradeable, $amount );
       if ( !is_null( $txFee ) ) {
         $txFees[] = $txFee;
       }

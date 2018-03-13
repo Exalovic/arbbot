@@ -162,7 +162,7 @@ class Database {
     // Read the three most recent balances for this coin on this exchange.
     $query = '';
     if ( $exchangeID == '0' ) {
-      $query = sprintf( "SELECT SUM(raw) AS amount FROM balances WHERE coin = '%s' GROUP BY created ORDER BY created DESC LIMIT 3", $coin );
+      $query = sprintf( "SELECT SUM(raw) AS amount FROM balances WHERE coin = '%s' AND ID_exchange = '0' GROUP BY created ORDER BY created DESC LIMIT 3", $coin );
     } else {
       $query = sprintf( "SELECT SUM(raw) AS amount FROM balances WHERE coin = '%s' AND ID_exchange = %d GROUP BY created ORDER BY created DESC LIMIT 3",
                         $coin, $exchangeID );
@@ -303,22 +303,96 @@ class Database {
 
   }
 
-  public static function saveWithdrawal( $coin, $amount, $address, $sourceExchangeID, $targetExchangeID ) {
+  public static function saveWithdrawal( $coin, $amount, $address, $sourceExchangeID, $targetExchangeID, $txFee ) {
 
     $link = self::connect();
+    $time = time();
     $query = sprintf( "INSERT INTO withdrawal (amount, coin, address, ID_exchange_source, ID_exchange_target, created) VALUES ('%s', '%s', '%s', %d, %d, %d);", //
             formatBTC( $amount ), //
             $coin, //
             $address, //
             $sourceExchangeID, //
             $targetExchangeID, //
-            time() //
+            $time //
+    );
+
+    if ( !mysql_query( $query, $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    $query = sprintf( "INSERT INTO pending_deposits (amount, coin, ID_withdrawal, ID_exchange, created) VALUES ('%s', '%s', %s, %d, %d);", //
+            formatBTC( $amount - $txFee ), //
+            $coin, //
+            'LAST_INSERT_ID()',
+            $targetExchangeID, //
+            $time //
     );
 
     if ( !mysql_query( $query, $link ) ) {
       throw new Exception( "database insertion error: " . mysql_error( $link ) );
     }
     mysql_close( $link );
+
+  }
+
+  public static function savePendingDeposit( $coin, $amount, $exchangeID ) {
+
+    $link = self::connect();
+
+    $query = sprintf( "INSERT INTO pending_deposits (amount, coin, ID_exchange, created) VALUES ('%s', '%s', %d, %d);", //
+            formatBTC( $amount ), //
+            $coin, //
+            $exchangeID, //
+            time() //
+    );
+
+    if ( !mysql_query( $query, $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    mysql_close( $link );
+
+  }
+
+  public static function getPendingDeposit( $coin, $exchangeID ) {
+
+    $link = self::connect();
+
+    $query = sprintf( "SELECT SUM(amount) AS amount FROM pending_deposits WHERE coin = '%s' AND ID_exchange = %d;", //
+            $coin, //
+            $exchangeID //
+    );
+
+    if ( !($result = mysql_query( $query, $link )) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    $row = mysql_fetch_assoc( $result );
+
+    mysql_close( $link );
+    return floatval( $row[ 'amount' ] );
+
+  }
+
+  public static function getPendingDeposits( $exchangeID ) {
+
+    $link = self::connect();
+
+    $query = sprintf( "SELECT SUM(amount) AS amount, coin FROM pending_deposits WHERE ID_exchange = %d GROUP BY coin;", //
+            $exchangeID //
+    );
+
+    if ( !($result = mysql_query( $query, $link )) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    $results = [ ];
+    while ( $row = mysql_fetch_assoc( $result ) ) {
+      $results[ $row[ 'coin' ] ] = $row[ 'amount' ];
+    }
+
+    mysql_close( $link );
+    return $results;
 
   }
 
@@ -345,7 +419,7 @@ class Database {
 
     $link = self::connect();
 
-    $query = 'SELECT * FROM snapshot WHERE created = (SELECT MAX(created) FROM snapshot)';
+    $query = 'SELECT * FROM current_snapshot';
 
     $result = mysql_query( $query, $link );
     if ( !$result ) {
@@ -371,6 +445,29 @@ class Database {
     return $results;
 
   }
+
+  public static function getCurrentSimulatedProfitRate() {
+
+    $link = self::connect();
+
+    $query = 'SELECT * FROM current_simulated_profit_rate ORDER BY ratio DESC';
+
+    $result = mysql_query( $query, $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $results = [ ];
+    while ( $row = mysql_fetch_assoc( $result ) ) {
+      $results[] = $row;
+    }
+
+    mysql_close( $link );
+
+    return $results;
+
+  }
+
 
   public static function getOpportunityCount( $coin, $currency, $exchangeID ) {
 
@@ -434,7 +531,7 @@ class Database {
 
     $link = self::connect();
 
-    $query = sprintf( "SELECT AVG(rate) AS rate FROM snapshot WHERE coin = '%s' GROUP BY created", mysql_escape_string( $coin ) );
+    $query = sprintf( "SELECT AVG(rate) AS rate FROM snapshot WHERE coin = '%s' GROUP BY created ORDER BY created", mysql_escape_string( $coin ) );
 
     $result = mysql_query( $query, $link );
     if ( !$result ) {
@@ -476,13 +573,74 @@ class Database {
       // Old database format, need to upgrade first.
       $result = mysql_query( "ALTER TABLE withdrawal MODIFY address TEXT NOT NULL;", $link );
       if ( !$result ) {
-        throw new Exception( "database selection error: " . mysql_error( $link ) );
+        throw new Exception( "database alteration error: " . mysql_error( $link ) );
       }
     }
 
     mysql_close( $link );
 
-    return $results;
+  }
+
+  public static function handleAlertsUpgrade() {
+
+    $link = self::connect();
+
+    $result = mysql_query( "SHOW COLUMNS FROM alerts LIKE 'type';", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $results = array();
+    $row = mysql_fetch_assoc( $result );
+    if ( $row[ 'Type' ] == "enum('stuck-transfer','poloniex-withdrawal-limit')" ) {
+      // Old database format, need to upgrade first.
+      $result = mysql_query( "ALTER TABLE alerts MODIFY `type` ENUM('stuck-transfer','poloniex-withdrawal-limit','duplicate-withdrawal') NOT NULL;", $link );
+      if ( !$result ) {
+        throw new Exception( "database alteration error: " . mysql_error( $link ) );
+      }
+    }
+
+    mysql_close( $link );
+
+  }
+
+  public static function handleCoinUpgrade() {
+
+    $link = self::connect();
+
+    $result = mysql_query( "SHOW COLUMNS FROM management LIKE 'coin';", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $row = mysql_fetch_assoc( $result );
+    if ( $row[ 'Type' ] == 'char(5)' ) {
+      // Old database format, need to upgrade first.
+      $upgrades = array(
+        [ 'balances', 'coin' ],
+        [ 'exchange_trades', 'coin' ],
+        [ 'exchange_trades', 'currency' ],
+        [ 'management', 'coin' ],
+        [ 'profits', 'currency' ],
+        [ 'profit_loss', 'coin' ],
+        [ 'profit_loss', 'currency' ],
+        [ 'snapshot', 'coin' ],
+        [ 'track', 'coin' ],
+        [ 'trade', 'coin' ],
+        [ 'withdrawal', 'coin' ],
+      );
+      foreach ( $upgrades as $item ) {
+        $table = $item[ 0 ];
+        $field = $item[ 1 ];
+        $result = mysql_query( sprintf( "ALTER TABLE %s MODIFY %s CHAR(10) NOT NULL;",
+                                        $table, $field ), $link );
+        if ( !$result ) {
+          throw new Exception( "database alteration error: " . mysql_error( $link ) );
+        }
+      }
+    }
+
+    mysql_close( $link );
 
   }
 
@@ -588,7 +746,7 @@ class Database {
       }
       $exchange = Exchange::createFromID( $row[ 'target' ] );
 
-      $price_sold = $matches[ 2 ] / $exchange->deductFeeFromAmountSell( $row[ 'amount' ] );
+      $price_sold = $matches[ 2 ] / $exchange->deductFeeFromAmountSell( $row[ 'amount' ], $row[ 'coin' ], $row[ 'currency' ] );
       $tx_fee = $matches[ 6 ] * $price_sold;
       $pl = $matches[ 4 ] - $tx_fee;
       if ($pl > 0) {
@@ -648,6 +806,64 @@ class Database {
     }
     mysql_close( $link );
 
+  }
+
+  public static function fixupProfitLossCalculations( &$exchanges ) {
+    $stats = self::getStats();
+
+    if ( @$stats[ 'profit_loss_fixup' ] != 1 ) {
+      $link = self::connect();
+
+      $result = mysql_query( "SELECT ID, created, ID_exchange_source, coin, tradeable_bought, rate_sell, tradeable_tx_fee, currency_tx_fee, currency_pl FROM profit_loss " .
+                             "WHERE trade_IDs_buy != '' OR trade_IDs_sell != '' OR raw_trade_IDs_buy != '' OR raw_trade_IDs_sell != '';",
+                             $link );
+      if ( !$result ) {
+        throw new Exception( "database selection error: " . mysql_error( $link ) );
+      }
+
+      $exchangeMap = [ ];
+      foreach ( $exchanges as $ex ) {
+        $exchangeMap[ $ex->getID() ] = $ex;
+        $ex->refreshExchangeData();
+      }
+      $cm = new CoinManager( $exchanges );
+
+      print "Fixing incorrect transfer fee calculations in the Profit&Loss data, this may take a while...\n";
+
+      while ( $row = mysql_fetch_assoc( $result ) ) {
+        // Poor man's progress bar
+        print strftime( "\rChecking transaction performed on %Y-%m-%d %H:%M:%S", $row[ 'created' ] );
+
+        $oldFee = floatval( $row[ 'tradeable_tx_fee' ] );
+        $oldFeeInCurrency = floatval( $row[ 'currency_tx_fee' ] );
+        $newFee = floatval( $cm->getSafeWithdrawFee( $exchangeMap[ $row[ 'ID_exchange_source' ] ], $row[ 'coin' ], $row[ 'tradeable_bought' ] ) +
+                            $cm->getSafeDepositFee( $exchangeMap[ $row[ 'ID_exchange_target' ] ], $row[ 'coin' ], $row[ 'tradeable_bought' ] ) );
+        $newFeeInCurrency = floatval( $row[ 'rate_sell' ] * $newFee );
+        if ( $oldFee != $newFee ) {
+          $diff = $newFeeInCurrency - $oldFeeInCurrency;
+          if ( $diff >= 0 ) {
+            // The fee data obtained from exchanges is subject to change.  If we get a positive diff here,
+            // the only possible explanation is a change in the transfer fees, so we can't know anything
+            // conclusive about what the real fees were at the transaction time unfortunately any more...
+            continue;
+          }
+
+          $result2 = mysql_query( sprintf( "UPDATE profit_loss SET tradeable_tx_fee = '%s', currency_tx_fee = '%s', " .
+                                           "currency_pl = '%s' WHERE ID = %d;",
+                                           formatBTC( $newFee ), formatBTC( $newFeeInCurrency ),
+                                           formatBTC( $row[ 'currency_pl' ] - $diff ), $row[ 'ID' ] ),
+                                  $link );
+          if ( !$result2 ) {
+            throw new Exception( "database insertion error: " . mysql_error( $link ) );
+          }
+        }
+      }
+
+      print "\n";
+
+      $stats[ 'profit_loss_fixup' ] = 1;
+      self::saveStats( $stats );
+    }
   }
 
   public static function getTop5ProfitableCoinsOfTheDay() {
@@ -800,6 +1016,27 @@ class Database {
     return self::createTableHelper( 'balances' );
 
   }
+
+  public static function createBalancesIndexIfNeeded() {
+
+    $link = self::connect();
+
+    $result = mysql_query( "SHOW INDEX FROM balances WHERE Key_name = 'coin_ID_exchange';", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $row = mysql_fetch_assoc( $result );
+    if ( !$row ) {
+      $result = mysql_query( "ALTER TABLE `balances` ADD INDEX `coin_ID_exchange` (`coin`, `ID_exchange`);", $link );
+      if ( !$result ) {
+        throw new Exception( "index creation error: " . mysql_error( $link ) );
+      }
+    }
+
+    mysql_close( $link );
+
+  }
   
   public static function getSmoothedResultsForGraph( $result ) {
   
@@ -830,10 +1067,18 @@ class Database {
 
   private static function importBalancesHelper( $coin, $exchange, $link ) {
 
-    $query = sprintf( "SELECT SUM(balance) AS data, created, ID_exchange FROM snapshot WHERE coin = '%s' %s GROUP BY created;", //
-            mysql_escape_string( $coin ), //
-            $exchange === "0" ? "" : sprintf( " AND ID_exchange = %d", mysql_escape_string( $exchange ) )
-    );
+    $query = '';
+    if ( $exchange === '0' ) {
+      $query = sprintf( "SELECT SUM(balance) AS data, created, '0' AS ID_exchange FROM snapshot WHERE coin = '%s' GROUP BY created;", //
+              mysql_escape_string( $coin )
+      );
+    } else {
+      // There is only one ID_exchange that we're selecting on, so MAX(ID_exchange) is the same as ID_exchange.
+      $query = sprintf( "SELECT SUM(balance) AS data, created, MAX(ID_exchange) AS ID_exchange FROM snapshot WHERE coin = '%s' AND ID_exchange = %d GROUP BY created;", //
+              mysql_escape_string( $coin ), //
+              mysql_escape_string( $exchange )
+      );
+    }
    
     $result = mysql_query( $query, $link );
     if ( !$result ) {
@@ -889,6 +1134,64 @@ class Database {
     print "\n";
 
     mysql_close( $link );
+
+  }
+
+  public static function currentSimulatedProfitsRateViewExists() {
+
+    return self::tableExistsHelper( 'current_simulated_profits_rate' );
+
+  }
+
+  public static function createCurrentSimulatedProfitsRateView() {
+
+    return self::createTableHelper( 'current_simulated_profits_rate' );
+
+  }
+
+  public static function pendingDepositsTableExists() {
+
+    return self::tableExistsHelper( 'pending_deposits' );
+
+  }
+
+  public static function createPendingDepositsTable() {
+
+    self::showPendingDepositTableWarning();
+
+    return self::createTableHelper( 'pending_deposits' );
+
+  }
+
+  private static function showPendingDepositTableWarning() {
+
+    print "Before proceeding, please make sure that there is no pending deposits in\n" .
+          "any of the active exchanges that the bot has access to, otherwise the bot's\n" .
+          "database will get corrupted during this upgrade process\n";
+    print "Press ENTER after checking all of your exchange accounts and making sure all\n" .
+          "pending deposits have been settled.\n";
+    readline();
+
+  }
+
+  public static function ensurePendingDepositsUpgraded() {
+
+    $stats = self::getStats();
+
+    if ( intval( @$stats[ 'pending_deposits_fixup' ] ) < 1 ) {
+
+      self::showPendingDepositTableWarning();
+
+      $link = self::connect();
+
+      $result = mysql_query( "DELETE FROM pending_deposits", $link );
+      if ( !$result ) {
+        throw new Exception( "database deletion error: " . mysql_error( $link ) );
+      }
+
+      $stats[ 'pending_deposits_fixup' ] = 1;
+      self::saveStats( $stats );
+    }
 
   }
 
@@ -956,6 +1259,76 @@ class Database {
   public static function createProfitLossTable() {
 
     return self::createTableHelper( 'profit_loss' );
+
+  }
+
+  public static function walletsTableExists() {
+
+    return self::tableExistsHelper( 'wallets' );
+
+  }
+
+  public static function createWalletsTable() {
+
+    return self::createTableHelper( 'wallets' );
+
+  }
+
+  public static function readWallets( $id ) {
+
+    $link = self::connect();
+
+    if ( !($result = mysql_query( sprintf( "SELECT * FROM wallets WHERE ID_exchange = %d;",
+                                            $id
+                                  ),
+                                  $link
+                     ) ) ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $wallets = [ ];
+    while ( $row = mysql_fetch_assoc( $result ) ) {
+      $wallets[ $row[ 'coin' ] ] = floatval( $row[ 'amount' ] );
+    }
+
+    return $wallets;
+
+  }
+
+  public static function saveWallets( $id, $wallets ) {
+
+    $link = self::connect();
+    $time = time();
+
+    if ( !mysql_query( "START TRANSACTION", $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    try {
+      if ( !mysql_query( sprintf( "DELETE FROM wallets WHERE ID_exchange = %d;", $id ), $link ) ) {
+        throw new Exception( "database insertion error: " . mysql_error( $link ) );
+      }
+  
+      foreach ( $wallets as $coin => $balance ) {
+        if ( !mysql_query( sprintf( "INSERT INTO wallets (created, coin, amount, ID_exchange) " .
+                                                          "VALUES (%d, '%s', '%s', %d);",
+                                    $time, mysql_escape_string( $coin ),
+                                    formatBTC( $balance ), $id ),
+                            $link ) ) {
+          throw new Exception( "database insertion error: " . mysql_error( $link ) );
+        }
+      }
+    }
+    catch ( Exception $ex ) {
+      mysql_query( "ROLLBACK", $link );
+      throw $ex;
+    }
+
+    if ( !mysql_query( "COMMIT", $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    mysql_close( $link );
 
   }
 

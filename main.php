@@ -31,11 +31,14 @@ catch ( Exception $ex ) {
   return;
 }
 
-logg( "ARBITRATOR V2.0 launching..." );
-sendmail( "Startup mail service test", "This is a test message to confirm that the mail service is working properly!" );
+logg( "ARBITRATOR V3.0 launching..." );
 logg( "Loading config..." );
 
 Database::handleAddressUpgrade();
+
+Database::handleAlertsUpgrade();
+
+Database::handleCoinUpgrade();
 
 Database::handleTrackUpgrade();
 
@@ -55,9 +58,35 @@ if ( !Database::balancesTableExists() ) {
   Database::importBalances();
 }
 
+Database::createBalancesIndexIfNeeded();
+
+if ( !Database::currentSimulatedProfitsRateViewExists() ) {
+  Database::createCurrentSimulatedProfitsRateView();
+}
+
+if ( !Database::pendingDepositsTableExists() ) {
+  print "Before proceeding, please make sure that there is no pending deposits in\n" .
+        "any of the active exchanges that the bot has access to, otherwise the bot's\n" .
+        "database will get corrupted during this upgrade process\n";
+  print "Press ENTER after checking all of your exchange accounts and making sure all\n" .
+        "pending deposits have been settled.\n";
+  readline();
+  Database::createPendingDepositsTable();
+}
+
+if ( !Database::pendingDepositsTableExists() ) {
+  Database::createPendingDepositsTable();
+} else {
+  Database::ensurePendingDepositsUpgraded();
+}
+
 if ( !Database::profitsTableExists() ) {
   Database::createProfitsTable();
   Database::importProfits();
+}
+
+if ( !Database::walletsTableExists() ) {
+  Database::createWalletsTable();
 }
 
 if ( !Database::profitLossTableExists() ) {
@@ -104,6 +133,8 @@ foreach ( $exchanges as $exchange ) {
   }
 }
 
+Database::fixupProfitLossCalculations( $exchanges );
+
 $tradeMatcher = new TradeMatcher( $exchanges );
 foreach ( $exchanges as $exchange ) {
 
@@ -111,13 +142,16 @@ foreach ( $exchanges as $exchange ) {
 
     logg( "Noticed new trades on " . $exchange->getName() . " that we haven't seen before, importing them now..." );
 
-    $csvPath = __DIR__ . '/' . $exchange->getTradeHistoryCSVName();
-    if ( ! is_readable( $csvPath ) ) {
-      $prompt = file_get_contents( __DIR__ . '/bot/xchange/' . $exchange->getName() . '-csv-missing.txt' );
-      logg( $prompt );
-      readline();
-      if ( !is_readable( $csvPath ) ) {
-        die( "Still can't find the file, refusing to continue\n" );
+    $name = $exchange->getTradeHistoryCSVName();
+    if ( $name ) {
+      $csvPath = __DIR__ . '/' . $name;
+      if ( ! is_readable( $csvPath ) ) {
+        $prompt = file_get_contents( __DIR__ . '/bot/xchange/' . $exchange->getName() . '-csv-missing.txt' );
+        logg( $prompt );
+        readline();
+        if ( !is_readable( $csvPath ) ) {
+          die( "Still can't find the file, refusing to continue\n" );
+        }
       }
     }
 
@@ -141,15 +175,3 @@ foreach ( $exchanges as $exchange ) {
 
 $arbitrator = new Arbitrator( $gEventLoop, $exchanges, $tradeMatcher );
 $arbitrator->run();
-
-function sendmail( $title, $message ) {
-  //
-  $mailRecipient = Config::get( Config::MAIL_RECIPIENT, null );
-
-  if ( is_null( $mailRecipient ) ) {
-    $mailRecipient = 'mail@example.com';
-  }
-  mail( $mailRecipient, "[ARB] " . $title, $message );
-
-
-}
