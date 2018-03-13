@@ -448,6 +448,7 @@ abstract class BittrexLikeExchange extends Exchange {
     curl_setopt( $ch, CURLOPT_HTTPHEADER, ["apisign: $sign" ] );
     curl_setopt( $ch, CURLOPT_CONNECTTIMEOUT, 10 );
     curl_setopt( $ch, CURLOPT_TIMEOUT, 180 );
+    curl_setopt( $ch, CURLOPT_FOLLOWLOCATION, TRUE );
 
     $error = null;
     for ( $i = 0; $i < 5; $i++ ) {
