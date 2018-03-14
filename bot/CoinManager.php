@@ -392,6 +392,11 @@ class CoinManager {
       $amount = min( $positiveExchanges[ $from ][ 'd' ], $negativeExchanges[ $to ][ 'd' ] );
       $source = $positiveExchanges[ $from ][ 'e' ];
       $target = $negativeExchanges[ $to ][ 'e' ];
+      
+      if ( $amount == 0 ){
+        break;
+      }
+
 
       $this->withdraw( $source, $target, $coin, $amount );
 
